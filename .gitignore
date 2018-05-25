@@ -1,0 +1,13 @@
+\#*
+*#
+*~
+*.swp
+*.kswp
+*.bak
+*.orig
+
+*.mod.c
+*.o
+*.ko
+*.so
+
