@@ -10,4 +10,8 @@
 *.o
 *.ko
 *.so
-
+*.tmp_versions
+*.symvers
+*.cmd
+*.mk
+modules.order
