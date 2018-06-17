@@ -54,7 +54,7 @@ static struct file_operations test_user_dma_fops = {
 	.release        = test_user_dma_release
 };
 
-#define N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR 4000
+#define N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR 100
 void *myy_dma_coherent_va_ptr;
 
 static int __init test_user_dma_init(void) {
@@ -112,14 +112,17 @@ failed_dma_alloc:
 /* module unload */
 static void __exit test_user_dma_exit(void)
 {
+	printk(KERN_INFO "cdev_del");
 	/* remove the character deivce */
 	cdev_del(&test_user_dma_cdev);
 	/* Free the space allocated for the character device */
+	printk(KERN_INFO "unregister_chrdev_region");
 	unregister_chrdev_region(test_user_dma_dev, 1);
 
+	printk(KERN_INFO "dma_free_coherent");
 	/* free the DMA mapped areas */
-	dma_free_coherent(NULL, N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR,
-		&myy_dma_handle, GFP_KERNEL);
+	dma_free_coherent(NULL, N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
+		myy_dma_coherent_va_ptr, GFP_KERNEL);
 }
 
 module_init(test_user_dma_init);

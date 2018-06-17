@@ -21,5 +21,5 @@ clean:
 	make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(PWD) -C $(MYY_KERNEL_DIR) clean
 
 install:
-	scp test-dma-to-from-user.ko 192.168.1.150:/tmp
+	scp test-dma-to-from-user.ko tinkerboard:/tmp
 
