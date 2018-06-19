@@ -18,6 +18,9 @@
 // dma_alloc_coherent
 #include <linux/dma-mapping.h>
 
+// clock functions
+#include <linux/clk.h>
+
 
 // -- OF
 
@@ -197,7 +200,11 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto dma_alloc_failed;
 	}
 
-	
+
+	devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
+	clk_prepare_enable(devm_clk_get(vpu_dev, "iface"));
+
 	/* Setup the private data storage for this device.
 	 * 
 	 * The data will be available through the device structure until
@@ -222,6 +229,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	 * 
 	 * alloc_chrdev_region will call MKDEV
 	 */
+	dev_info(vpu_dev, "alloc_chrdev_region");
 	ret = alloc_chrdev_region(&driver_data->device_id, 0, 1, name);
 	if (ret)
 	{
@@ -229,8 +237,11 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto chrdev_alloc_failed;
 	}
 
+	dev_info(vpu_dev, "cdev_init");
 	cdev_init(cdev, &test_user_dma_fops);
 	cdev->owner = THIS_MODULE;
+
+	dev_info(vpu_dev, "cdev_add");
 	ret = cdev_add(cdev, driver_data->device_id, 1);
 
 	if (ret)
@@ -239,6 +250,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto cdev_add_failed;
 	}
 
+	dev_info(vpu_dev, "class_create");
 	driver_data->cls = class_create(THIS_MODULE, name);
 
 	if (IS_ERR(driver_data->cls))
@@ -248,6 +260,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto class_create_failed;
 	}
 
+	dev_info(vpu_dev, "device_create");
 	driver_data->sub_dev = device_create(
 		driver_data->cls, vpu_dev,
 		driver_data->device_id, NULL,
