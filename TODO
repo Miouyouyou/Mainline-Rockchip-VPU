@@ -1,2 +1,3 @@
 * Disable the clocks when shutting down
-
+* Add debug to rk_iommu_probe
+* Add dump_stack to arm_setup_iommu_dma_ops

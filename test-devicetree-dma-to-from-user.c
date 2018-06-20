@@ -184,25 +184,14 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	/* Used to check various return codes for errors */
 	int ret;
 
-	print_platform_device(pdev);
+	/*print_platform_device(pdev);*/
 
 	/* Allocate the DMA buffer */
-	driver_data->myy_dma.cpu_address = dma_alloc_coherent(vpu_dev,
-		N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
-		&driver_data->myy_dma.handle, GFP_KERNEL);
-
-	if (!driver_data->myy_dma.cpu_address)
-	{
-		dev_err(vpu_dev,
-			"DMA Alloc coherent could not allocate\n"
-			"Calling the cops right now !\n");
-		ret = -ENOMEM;
-		goto dma_alloc_failed;
-	}
-
-
+	dev_info(vpu_dev, "devm_ioremap_resource");
 	devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	dev_info(vpu_dev, "clk_prepare_enable aclk");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
+	dev_info(vpu_dev, "clk_prepare_enable iface");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "iface"));
 
 	/* Setup the private data storage for this device.
@@ -275,6 +264,19 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto device_create_failed;
 	}
 
+	driver_data->myy_dma.cpu_address = dma_alloc_coherent(vpu_dev,
+		N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
+		&driver_data->myy_dma.handle, GFP_KERNEL);
+
+	if (!driver_data->myy_dma.cpu_address)
+	{
+		dev_err(vpu_dev,
+			"DMA Alloc coherent could not allocate\n"
+			"Calling the cops right now !\n");
+		ret = -ENOMEM;
+		goto dma_alloc_failed;
+	}
+
 	return ret;
 
 device_create_failed:
@@ -335,9 +337,6 @@ static void myy_vpu_shutdown(struct platform_device *pdev)
 static struct of_device_id const myy_vpu_dt_ids[] = {
 	{
 		.compatible = "rockchip,vpu_service",
-	},
-	{
-		.compatible = "rockchip,hevc_service",
 	},
 	{}
 };
