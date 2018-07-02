@@ -134,7 +134,11 @@ static void print_platform_device
 /// Open/IOCTL/Close/MMAP
 
 static int test_user_dma_open(struct inode *inode, struct file *filp) {
+	struct myy_driver_data * __restrict const myy_driver_data =
+		container_of(inode->i_cdev, struct myy_driver_data, cdev);
 	printk(KERN_INFO "Open !");
+	/* This backflip bullshit always got me */
+	filp->private_data = myy_driver_data;
 	return 0;
 };
 static long test_user_dma_ioctl(struct file * const filp,
@@ -146,9 +150,23 @@ static long test_user_dma_ioctl(struct file * const filp,
 static int test_user_dma_mmap(struct file *filp,
 	struct vm_area_struct *vma)
 {
+	struct myy_driver_data const * __restrict const myy_driver_data =
+		(struct myy_driver_data const *)
+		filp->private_data;
+	int ret;
 	printk(KERN_INFO "MMAP !");
-	return 0;
+
+	ret = dma_common_mmap(NULL, vma,
+		myy_driver_data->myy_dma.cpu_address,
+		myy_driver_data->myy_dma.handle,
+		vma->vm_end - vma->vm_start);
+
+	if (ret)
+		printk(KERN_INFO "MMAP failed :C : -%d\n", ret);
+
+	return ret;
 };
+
 static int test_user_dma_release(struct inode * inode,
 	struct file * filp)
 {
@@ -189,8 +207,10 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	/* Allocate the DMA buffer */
 	dev_info(vpu_dev, "devm_ioremap_resource");
 	devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	
 	dev_info(vpu_dev, "clk_prepare_enable aclk");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
+	
 	dev_info(vpu_dev, "clk_prepare_enable iface");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "iface"));
 
