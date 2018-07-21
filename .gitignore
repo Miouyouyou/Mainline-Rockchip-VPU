@@ -15,3 +15,5 @@
 *.cmd
 *.mk
 modules.order
+*.kate-swp
+
