@@ -35,10 +35,21 @@
 // of_find_device_by_node
 #include <linux/of_platform.h>
 
+// Adds test_regs and test_encoded_frame
+#include "test_static_data.h"
+
+
+// TODO : Copy the frame
+//        Pass the registers to the VPU
+//        Start the whole thing
+//        -> Should be done through a simple memcpy ?
+//           Or a memcpy + write ?
+//           What about the IRQ handlers ?
+//        Get the result
+
 
 // Structures
-
-#define N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR 100
+#define N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR 2025
 
 struct myy_dma {
 	dma_addr_t handle;
