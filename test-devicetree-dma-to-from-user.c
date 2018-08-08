@@ -38,6 +38,12 @@
 // Adds test_regs and test_encoded_frame
 #include "test_static_data.h"
 
+// Adds cabac_table
+#include "test_static_tables.h"
+
+// Provide H264dVdpu1Regs_t
+#include "rkmpp_h264_vpu_regs.h"
+
 
 // TODO : Copy the frame
 //        Pass the registers to the VPU
@@ -49,15 +55,18 @@
 
 
 // Structures
-#define N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR 2025
+#define N_PAGES_FOR_1080P_RGBA32 (2025 * PAGE_SIZE)
 
 struct myy_dma {
-	dma_addr_t handle;
-	void *cpu_address;
+	dma_addr_t iommu_address;
+	void *mmu_address;
 };
 
 struct myy_driver_data {
-	struct myy_dma myy_dma;
+	struct myy_dma output_frame;
+	struct myy_dma cabac_table;
+	// Our test only uses 1 frame, with no dependencies
+	struct myy_dma encoded_frame; 
 	dev_t device_id;
 	struct class * __restrict cls;
 	struct device * __restrict sub_dev;
@@ -144,21 +153,73 @@ static void print_platform_device
 
 /// Open/IOCTL/Close/MMAP
 
-static int test_user_dma_open(struct inode *inode, struct file *filp) {
+static int test_user_dma_open(
+	struct inode *inode,
+	struct file *filp)
+{
 	struct myy_driver_data * __restrict const myy_driver_data =
 		container_of(inode->i_cdev, struct myy_driver_data, cdev);
 	printk(KERN_INFO "Open !");
 	/* This backflip bullshit always got me */
 	filp->private_data = myy_driver_data;
 	return 0;
-};
-static long test_user_dma_ioctl(struct file * const filp,
-	unsigned int const cmd, unsigned long const arg)
+}
+
+// TODO : Factoriser
+static inline void * allocate_dma_space(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	dma_addr_t * __restrict const returned_dma_handle)
 {
-	printk(KERN_INFO "IOCTL !");
+	return dma_alloc_coherent(dev,
+		ALIGN(size_in_octets, PAGE_SIZE),
+		returned_dma_handle, GFP_KERNEL);
+}
+
+static inline void free_all_dma_space(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	void * __restrict const mmu_address)
+{
+	dma_free_coherent(dev,
+		ALIGN(size_in_octets, PAGE_SIZE),
+		mmu_address, GFP_KERNEL);
+}
+
+static void * allocate_dma_space_and_copy(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	dma_addr_t * __restrict const returned_dma_handle,
+	u8 const * __restrict const data_to_copy,
+	u32 const data_size_in_octets)
+{
+	void * cpu_mmu_address = allocate_dma_space(
+		dev, ALIGN(size_in_octets, PAGE_SIZE),
+		returned_dma_handle);
+
+	if (cpu_mmu_address)
+		memcpy(cpu_mmu_address, data_to_copy, data_size_in_octets);
+
+	return cpu_mmu_address;
+}
+
+static long test_user_dma_ioctl(
+	struct file * const filp,
+	unsigned int const cmd,
+	unsigned long const arg)
+{
+
+
+	printk("IOCTL");
+
+
+	//vdpu_write(vpu, VDPU_REG_INTERRUPT_DEC_E, VDPU_REG_INTERRUPT);
 	return 0;
-};
-static int test_user_dma_mmap(struct file *filp,
+	
+}
+
+static int test_user_dma_mmap(
+	struct file *filp,
 	struct vm_area_struct *vma)
 {
 	struct myy_driver_data const * __restrict const myy_driver_data =
@@ -168,22 +229,23 @@ static int test_user_dma_mmap(struct file *filp,
 	printk(KERN_INFO "MMAP !");
 
 	ret = dma_common_mmap(NULL, vma,
-		myy_driver_data->myy_dma.cpu_address,
-		myy_driver_data->myy_dma.handle,
+		myy_driver_data->output_frame.mmu_address,
+		myy_driver_data->output_frame.iommu_address,
 		vma->vm_end - vma->vm_start);
 
 	if (ret)
 		printk(KERN_INFO "MMAP failed :C : -%d\n", ret);
 
 	return ret;
-};
+}
 
-static int test_user_dma_release(struct inode * inode,
+static int test_user_dma_release(
+	struct inode * inode,
 	struct file * filp)
 {
 	printk(KERN_INFO "Close !");
 	return 0;
-};
+}
 
 
 static struct file_operations test_user_dma_fops = {
@@ -213,6 +275,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	/* Used to check various return codes for errors */
 	int ret;
 
+
 	/*print_platform_device(pdev);*/
 
 	/* Allocate the DMA buffer */
@@ -221,7 +284,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	
 	dev_info(vpu_dev, "clk_prepare_enable aclk");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
-	
+
 	dev_info(vpu_dev, "clk_prepare_enable iface");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "iface"));
 
@@ -295,21 +358,61 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto device_create_failed;
 	}
 
-	driver_data->myy_dma.cpu_address = dma_alloc_coherent(vpu_dev,
-		N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
-		&driver_data->myy_dma.handle, GFP_KERNEL);
+	driver_data->output_frame.mmu_address = dma_alloc_coherent(vpu_dev,
+		N_PAGES_FOR_1080P_RGBA32,
+		&driver_data->output_frame.iommu_address, GFP_KERNEL);
 
-	if (!driver_data->myy_dma.cpu_address)
+	if (!driver_data->output_frame.mmu_address)
 	{
 		dev_err(vpu_dev,
 			"DMA Alloc coherent could not allocate\n"
 			"Calling the cops right now !\n");
 		ret = -ENOMEM;
-		goto dma_alloc_failed;
+		goto output_frame_dma_alloc_failed;
+	}
+
+	driver_data->encoded_frame.mmu_address =
+		allocate_dma_space_and_copy(
+			vpu_dev,
+			sizeof(test_encoded_frame),
+			&driver_data->encoded_frame.iommu_address,
+			test_encoded_frame,
+			sizeof(test_encoded_frame));
+
+	if (!driver_data->encoded_frame.mmu_address)
+	{
+		dev_err(vpu_dev,
+			"No memory for the encoded frame :C\n");
+		ret = -ENOMEM;
+		goto encoded_frame_dma_alloc_failed;
+	}
+
+	driver_data->cabac_table.mmu_address =
+		allocate_dma_space_and_copy(vpu_dev,
+			sizeof(h264_cabac_table),
+			&driver_data->cabac_table.iommu_address,
+			(u8 const *) h264_cabac_table,
+			sizeof(h264_cabac_table));
+
+	if (!driver_data->cabac_table.mmu_address)
+	{
+		dev_err(vpu_dev,
+			"No memory for the cabac table :C\n");
+		ret = -ENOMEM;
+		goto cabac_table_dma_alloc_failed;
 	}
 
 	return ret;
 
+cabac_table_dma_alloc_failed:
+	free_all_dma_space(vpu_dev,
+		sizeof(test_encoded_frame),
+		&driver_data->encoded_frame.mmu_address);
+encoded_frame_dma_alloc_failed:
+	dma_free_coherent(vpu_dev,
+		N_PAGES_FOR_1080P_RGBA32,
+		&driver_data->output_frame.mmu_address, GFP_KERNEL);
+output_frame_dma_alloc_failed:
 device_create_failed:
 	class_destroy(driver_data->cls);
 class_create_failed:
@@ -317,10 +420,6 @@ class_create_failed:
 cdev_add_failed:
 	unregister_chrdev_region(driver_data->device_id, 1);
 chrdev_alloc_failed:
-	dma_free_coherent(vpu_dev,
-		N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
-		&driver_data->myy_dma.cpu_address, GFP_KERNEL);
-dma_alloc_failed:
 	return ret;
 }
 
@@ -346,9 +445,19 @@ static int myy_vpu_remove(struct platform_device * pdev)
 	dev_info(vpu_dev, "chrdev_region unregistered\n");
 
 	dma_free_coherent(&pdev->dev,
-		N_PAGES_FOR_4Kx4Kx4_BYTES_PER_COLOR * PAGE_SIZE,
-		driver_data->myy_dma.cpu_address, GFP_KERNEL);
-	dev_info(vpu_dev, "DMA buffer Freed\n");
+		N_PAGES_FOR_1080P_RGBA32,
+		driver_data->output_frame.mmu_address, GFP_KERNEL);
+
+	free_all_dma_space(vpu_dev,
+		sizeof(test_encoded_frame),
+		driver_data->encoded_frame.mmu_address);
+
+	free_all_dma_space(vpu_dev,
+		sizeof(h264_cabac_table),
+		driver_data->cabac_table.mmu_address);
+
+	dev_info(vpu_dev, "DMA buffers Freed\n");
+
 
 	printk(KERN_INFO "Okay, I'll go, I'll go... !\n");
 
