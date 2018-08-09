@@ -44,6 +44,10 @@
 // Provide H264dVdpu1Regs_t
 #include "rkmpp_h264_vpu_regs.h"
 
+// irqreturn_t, IRQ_HANDLED, devm_request_threaded_irq
+#include <linux/interrupt.h>
+#include <linux/of_irq.h>
+
 
 // TODO : Copy the frame
 //        Pass the registers to the VPU
@@ -101,6 +105,19 @@ struct myy_driver_data {
 };
 
 // Functions
+
+/// Interrupt Request handlers
+
+static irqreturn_t vpu_is_done_or_borked(
+	int irq, void *dev_id)
+{
+	/* Currently, we don't care about interruptions.
+	 * It seems they're only called if the VPU has finished
+	 * a job or if some issue happened (bad setup, ...).
+	 */
+	printk(KERN_INFO "IRQ : %d\n", irq);
+	return IRQ_HANDLED;
+}
 
 /// Helpers
 
@@ -260,6 +277,9 @@ static struct file_operations test_user_dma_fops = {
 /* Should return 0 on success and a negative errno on failure. */
 static int myy_vpu_probe(struct platform_device * pdev)
 {
+	/* TODO Fragment this stupidly long function into several
+	 *      parts.
+	 */
 	/* The device associated with the platform_device. Identifier
 	 * used for convenience. (Dereferencing pdev every time is useless) */
 	struct device * __restrict const vpu_dev = &pdev->dev;
@@ -271,6 +291,9 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	/* Will be used to create /dev entries */
 	struct cdev * __restrict const cdev = &driver_data->cdev;
 	const char * __restrict const name = pdev->dev.of_node->name;
+
+	/* The "I'm done" or "The setup was invalid" IRQ number */
+	int irq_dec;
 
 	/* Used to check various return codes for errors */
 	int ret;
@@ -402,16 +425,41 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto cabac_table_dma_alloc_failed;
 	}
 
+	/* Setup the IRQ */
+	irq_dec = platform_get_irq_byname(pdev, "irq_dec");
+	if (irq_dec <= 0) {
+		dev_err(vpu_dev,
+			"Could not get the VPU Decoding IRQ number...\n");
+		ret = -ENXIO;
+		goto get_vdpu_irq_failed;
+	}
+
+	/* TODO Why Threaded ? Why not any context ? */
+	ret = devm_request_threaded_irq(
+		vpu_dev, irq_dec,
+		vpu_is_done_or_borked, NULL,
+		IRQF_ONESHOT, dev_name(vpu_dev), driver_data);
+
+	if (ret) {
+		dev_err(vpu_dev,
+			"Could not setup the IRQ handler : %d\n", ret);
+		goto get_vdpu_irq_failed;
+	}
+
 	return ret;
 
+get_vdpu_irq_failed:
+	free_all_dma_space(vpu_dev,
+		sizeof(test_encoded_frame),
+		driver_data->cabac_table.mmu_address);
 cabac_table_dma_alloc_failed:
 	free_all_dma_space(vpu_dev,
 		sizeof(test_encoded_frame),
-		&driver_data->encoded_frame.mmu_address);
+		driver_data->encoded_frame.mmu_address);
 encoded_frame_dma_alloc_failed:
 	dma_free_coherent(vpu_dev,
 		N_PAGES_FOR_1080P_RGBA32,
-		&driver_data->output_frame.mmu_address, GFP_KERNEL);
+		driver_data->output_frame.mmu_address, GFP_KERNEL);
 output_frame_dma_alloc_failed:
 device_create_failed:
 	class_destroy(driver_data->cls);
