@@ -48,7 +48,7 @@
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
 
-
+#include <linux/delay.h>
 // TODO : Copy the frame
 //        Pass the registers to the VPU
 //        Start the whole thing
@@ -59,7 +59,7 @@
 
 
 // Structures
-#define N_PAGES_FOR_1080P_RGBA32 (2025 * PAGE_SIZE)
+#define N_PAGES_FOR_1080P_RGBA32 (1000 * PAGE_SIZE)
 
 struct myy_dma {
 	dma_addr_t iommu_address;
@@ -273,6 +273,68 @@ static struct file_operations test_user_dma_fops = {
 	.release        = test_user_dma_release
 };
 
+static void print_regs(
+	struct device const * __restrict const device,
+	u32 const * __restrict const regs)
+{
+	unsigned int i;
+
+	dev_info(device, "[Current VPU registers state]\n");
+	dev_info(device, "u32 vpu_regs[101] = {\n");
+	for (i = 0; i < 100; i += 4)
+	{
+		dev_info(device,
+			"\t0x%08x, 0x%08x, 0x%08x, 0x%08x,\n",
+			regs[i], regs[i+1], regs[i+2], regs[i+3]);
+	}
+
+	dev_info(device, "\t0x%08x\n", regs[100]);
+	dev_info(device, "};\n");
+}
+
+static void print_dma_addresses(
+	struct device const * __restrict const device,
+	struct myy_driver_data const * __restrict const driver_data)
+{
+	dev_info(device, "[DMA Addresses]\n");
+	dev_info(device, "NAME   MMU      IOMMU\n");
+	dev_info(device, "---------------------\n");
+	dev_info(device, "%6s %p 0x%08x\n",
+			"Input",
+			driver_data->encoded_frame.mmu_address, 
+			driver_data->encoded_frame.iommu_address);
+	dev_info(device, "%6s %p 0x%08x\n",
+			"Output",
+			driver_data->output_frame.mmu_address,
+			driver_data->output_frame.iommu_address);
+	dev_info(device, "%6s %p 0x%08x\n",
+			"CABAC",
+			driver_data->cabac_table.mmu_address,
+			driver_data->cabac_table.iommu_address);
+}
+
+static void prepare_the_registers(
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 * __restrict const regs)
+{
+	unsigned int i;
+
+	/* Input address */
+	regs[12] = driver_data->encoded_frame.iommu_address;
+
+	/* Output and reference frames addresses */
+	for (i = 13; i < 30; i++)
+		regs[i] = driver_data->output_frame.iommu_address;
+
+	regs[40] = driver_data->cabac_table.iommu_address;
+
+	// TODO This frame also contains the size of the frame.
+	// It seems to be some kind of hack due to design limits
+	// of the VPU
+	// TODO Check the real purpose of this reg.
+	regs[41] = driver_data->output_frame.iommu_address;
+
+}
 
 /* Should return 0 on success and a negative errno on failure. */
 static int myy_vpu_probe(struct platform_device * pdev)
@@ -305,6 +367,8 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	dev_info(vpu_dev, "devm_ioremap_resource");
 	devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
 	
+	// FIXME Setup the clocks in a reliable fashion.
+	// FIXME Disable the clocks on unload...
 	dev_info(vpu_dev, "clk_prepare_enable aclk");
 	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
 
@@ -381,9 +445,11 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto device_create_failed;
 	}
 
-	driver_data->output_frame.mmu_address = dma_alloc_coherent(vpu_dev,
-		N_PAGES_FOR_1080P_RGBA32,
-		&driver_data->output_frame.iommu_address, GFP_KERNEL);
+	driver_data->output_frame.mmu_address = 
+		allocate_dma_space(
+			vpu_dev,
+			1920*1080*4, // RGBA8888 : 4 bytes per pixel
+			&driver_data->output_frame.iommu_address);
 
 	if (!driver_data->output_frame.mmu_address)
 	{
@@ -446,6 +512,10 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto get_vdpu_irq_failed;
 	}
 
+	print_dma_addresses(vpu_dev, driver_data);
+	print_regs(vpu_dev, test_regs);
+	prepare_the_registers(driver_data, test_regs);
+	print_regs(vpu_dev, test_regs);
 	return ret;
 
 get_vdpu_irq_failed:
@@ -457,6 +527,7 @@ cabac_table_dma_alloc_failed:
 		sizeof(test_encoded_frame),
 		driver_data->encoded_frame.mmu_address);
 encoded_frame_dma_alloc_failed:
+output_frame_dma_iommu_alloc_failed:
 	dma_free_coherent(vpu_dev,
 		N_PAGES_FOR_1080P_RGBA32,
 		driver_data->output_frame.mmu_address, GFP_KERNEL);
