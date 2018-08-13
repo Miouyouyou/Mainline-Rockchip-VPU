@@ -66,6 +66,16 @@ struct myy_dma {
 	void *mmu_address;
 };
 
+struct myy_vpu_io {
+	void __iomem * base;
+	u32 __iomem * dec_regs;
+};
+
+struct myy_vpu_clocks {
+	struct clk * aclk;
+	struct clk * iface;
+};
+
 struct myy_driver_data {
 	struct myy_dma output_frame;
 	struct myy_dma cabac_table;
@@ -74,6 +84,8 @@ struct myy_driver_data {
 	dev_t device_id;
 	struct class * __restrict cls;
 	struct device * __restrict sub_dev;
+	struct myy_vpu_io vpu_io;
+	struct myy_vpu_clocks vpu_clocks;
 	/* Not a pointer in order to use the container_of macro hack to get
 	 * back this allocated data structure.
 	 * 
@@ -220,6 +232,34 @@ static void * allocate_dma_space_and_copy(
 	return cpu_mmu_address;
 }
 
+static void copy_registers_and_launch_decoding(
+	struct device * __restrict const vpu,
+	u32 const * __restrict const regs)
+{
+	u32 const vpu_hw_regs_offset = 0x400;
+	u32 * __restrict const hw_regs = vpu + vpu_hw_regs_offset;
+	u32 i;
+	/* According to Rockchip "vpu_service" code, only the registers
+	 * 0, [2,59] should be copied.
+	 * Well, reg[1] contains the "Let's do this !" bit which will
+	 * just launch the VPU.
+	 * If you copy blindly, the VPU will just run before being set
+	 * up correctly, leading to all sorts of problems.
+	 */
+
+	// I don't know what the base is for...
+	writel_relaxed(regs[0], hw_regs);
+
+	// Prepare the VPU
+	for (i = 2; i < 59; i++)
+	{
+		writel_relaxed(regs[i], hw_regs + i);
+	}
+
+	// Let's do this !
+	writel_relaxed(regs[1], hw_regs + 1);
+}
+
 static long test_user_dma_ioctl(
 	struct file * const filp,
 	unsigned int const cmd,
@@ -228,7 +268,6 @@ static long test_user_dma_ioctl(
 
 
 	printk("IOCTL");
-
 
 	//vdpu_write(vpu, VDPU_REG_INTERRUPT_DEC_E, VDPU_REG_INTERRUPT);
 	return 0;
@@ -318,6 +357,7 @@ static void prepare_the_registers(
 	u32 * __restrict const regs)
 {
 	unsigned int i;
+	unsigned int offset;
 
 	/* Input address */
 	regs[12] = driver_data->encoded_frame.iommu_address;
@@ -328,11 +368,38 @@ static void prepare_the_registers(
 
 	regs[40] = driver_data->cabac_table.iommu_address;
 
-	// TODO This frame also contains the size of the frame.
-	// It seems to be some kind of hack due to design limits
-	// of the VPU
-	// TODO Check the real purpose of this reg.
-	regs[41] = driver_data->output_frame.iommu_address;
+	/* TODO This frame also contains an... offset ?
+	 *
+	 * It seems to be some kind of hack due to design limits
+	 * of the VPU.
+	 * 
+	 * The offset is computed like this on RKMPP
+	 *
+	 * {
+		RK_U32 dirMvOffset = 0;
+		RK_U32 picSizeInMbs = 0;
+
+		picSizeInMbs = p_hal->pp->wFrameWidthInMbsMinus1 + 1;
+		picSizeInMbs = picSizeInMbs * (2 - pp->frame_mbs_only_flag)
+			* (pp->wFrameHeightInMbsMinus1 + 1);
+		dirMvOffset = picSizeInMbs
+			* ((p_hal->pp->chroma_format_idc == 0) ? 256 : 384);
+		dirMvOffset += (pp->field_pic_flag && pp->CurrPic.AssociatedFlag)
+			? (picSizeInMbs * 32) : 0;
+		p_regs->SwReg41.dmmv_st_adr = (mpp_buffer_get_fd(frame_buf) | (dirMvOffset << 6));
+	  * }
+	  */
+	/* ... Used as an offset when the IDC profile is superior
+	 * to 66... which is completely broken because, on this
+	 * example since (0x0bf40000) >> 10 gives 195840
+	 * The frame in itself is only 6128 bytes long...
+	 * That doesn't make any sense to me but all the others
+	 * drivers does the same shit, so let's do the same thing.
+	 * Maybe this register is documented somewhere...
+	 */
+	offset = regs[41] >> 10;
+	regs[41] = driver_data->output_frame.iommu_address +
+		offset;
 
 }
 
@@ -353,6 +420,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	/* Will be used to create /dev entries */
 	struct cdev * __restrict const cdev = &driver_data->cdev;
 	const char * __restrict const name = pdev->dev.of_node->name;
+	void * vpu_base_address;
 
 	/* The "I'm done" or "The setup was invalid" IRQ number */
 	int irq_dec;
@@ -365,7 +433,17 @@ static int myy_vpu_probe(struct platform_device * pdev)
 
 	/* Allocate the DMA buffer */
 	dev_info(vpu_dev, "devm_ioremap_resource");
-	devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	vpu_base_address =
+		devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	if(IS_ERR(vpu_base_address)) {
+		dev_err("Could not remap the VPU resources...");
+		dev_err("So we can't address it, basically...");
+		ret = vpu_base_address;
+		goto ioremap_failed;
+	}
+
+	driver_data->vpu_io.base     = vpu_base_address;
+	driver_data->vpu_io.dec_regs = vpu_base_address + driver_data->vpu_io.base
 	
 	// FIXME Setup the clocks in a reliable fashion.
 	// FIXME Disable the clocks on unload...
@@ -539,6 +617,7 @@ class_create_failed:
 cdev_add_failed:
 	unregister_chrdev_region(driver_data->device_id, 1);
 chrdev_alloc_failed:
+ioremap_failed:
 	return ret;
 }
 
