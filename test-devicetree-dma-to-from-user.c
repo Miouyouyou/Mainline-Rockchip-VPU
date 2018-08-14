@@ -109,7 +109,7 @@ struct myy_driver_data {
 	 * This will NEVER work if we allocate a memory region for cdev, using
 	 * `cdev_alloc` and only store its address in `myy_driver_data`,
 	 * since the address of `myy_driver_data` and the address of `cdev`
-	 * would be then uncorrelated !
+	 * would be then unrelated !
 	 * 
 	 * Still, this is the kind of hack that only pass in kernel code.
 	 */
@@ -124,11 +124,16 @@ struct myy_driver_data {
 static irqreturn_t vpu_is_done_or_borked(
 	int irq, void *dev_id)
 {
+	struct myy_driver_data const * __restrict const driver_data =
+		(struct myy_driver_data const * __restrict) dev_id;
+
 	/* Currently, we don't care about interruptions.
 	 * It seems they're only called if the VPU has finished
 	 * a job or if some issue happened (bad setup, ...).
 	 */
 	printk(KERN_INFO "IRQ : %d\n", irq);
+
+	writel_relaxed(0, driver_data->vpu_io.dec_regs + 1);
 	return IRQ_HANDLED;
 }
 
@@ -258,7 +263,7 @@ static void copy_registers_and_launch_decoding(
 	}
 
 	// Let's do this !
-	writel_relaxed(regs[1], hw_regs + 1);
+	writel_relaxed(1, hw_regs + 1);
 }
 
 static long test_user_dma_ioctl(
@@ -323,7 +328,7 @@ static void print_regs(
 	dev_info(device, "u32 vpu_regs[101] = {\n");
 	for (i = 0; i < 100; i += 4)
 	{
-		dev_info(device,
+		dev_err(device,
 			"\t0x%08x, 0x%08x, 0x%08x, 0x%08x,\n",
 			regs[i], regs[i+1], regs[i+2], regs[i+3]);
 	}
@@ -673,8 +678,8 @@ cabac_table_dma_alloc_failed:
 		sizeof(test_encoded_frame),
 		driver_data->encoded_frame.mmu_address);
 encoded_frame_dma_alloc_failed:
-	dma_free_coherent(vpu_dev,
-		N_PAGES_FOR_1080P_RGBA32,
+	free_all_dma_space(vpu_dev,
+		1920*1080*4,
 		driver_data->output_frame.mmu_address, GFP_KERNEL);
 output_frame_dma_alloc_failed:
 device_create_failed:
@@ -711,8 +716,8 @@ static int myy_vpu_remove(struct platform_device * pdev)
 	unregister_chrdev_region(driver_data->device_id, 1);
 	dev_info(vpu_dev, "chrdev_region unregistered\n");
 
-	dma_free_coherent(&pdev->dev,
-		N_PAGES_FOR_1080P_RGBA32,
+	free_all_dma_space(vpu_dev,
+		1920*1080*4,
 		driver_data->output_frame.mmu_address, GFP_KERNEL);
 
 	free_all_dma_space(vpu_dev,

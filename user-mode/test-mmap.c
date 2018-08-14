@@ -1,3 +1,5 @@
+#include <stdint.h>
+
 #include <stdio.h>
 #include <sys/mman.h>
 
@@ -12,9 +14,9 @@
 int main(void)
 {
 	int fd;
-	void *address_from_mmap;
+	uint8_t *address_from_mmap;
 
-	int len = 100 * getpagesize();
+	uint32_t len = 1920 * 1080 * 4;
 
 	if ((fd=open("/dev/vpu-service", O_RDWR|O_SYNC)) < 0) {
 		perror("open");
@@ -31,7 +33,16 @@ int main(void)
 		perror("mmap");
 		exit(-1);
 	}
-	
+
+	int const out_fd =
+		open("output_frame", O_RDWR|O_CREAT, 00664);
+	if (out_fd < 0)
+		perror("Could not create the output file\n");
+	else {
+		write(out_fd, address_from_mmap, len);
+		close(out_fd);
+	}
+
 	fprintf(stderr,
 		"mmap_alloc: mmap OK - Address : %p\n",
 		 address_from_mmap);
