@@ -60,6 +60,7 @@
 
 // Structures
 #define N_PAGES_FOR_1080P_RGBA32 (1000 * PAGE_SIZE)
+#define VPU_DEC_REGS_OFFSET 0x400
 
 struct myy_dma {
 	dma_addr_t iommu_address;
@@ -234,10 +235,10 @@ static void * allocate_dma_space_and_copy(
 
 static void copy_registers_and_launch_decoding(
 	struct device * __restrict const vpu,
+	struct myy_driver_data const * __restrict const driver_data,
 	u32 const * __restrict const regs)
 {
-	u32 const vpu_hw_regs_offset = 0x400;
-	u32 * __restrict const hw_regs = vpu + vpu_hw_regs_offset;
+	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
 	u32 i;
 	/* According to Rockchip "vpu_service" code, only the registers
 	 * 0, [2,59] should be copied.
@@ -397,10 +398,78 @@ static void prepare_the_registers(
 	 * drivers does the same shit, so let's do the same thing.
 	 * Maybe this register is documented somewhere...
 	 */
-	offset = regs[41] >> 10;
+	offset = 0; // regs[41] >> 10;
 	regs[41] = driver_data->output_frame.iommu_address +
 		offset;
 
+}
+
+static void disable_clocks(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data const * __restrict const driver_data)
+{
+	clk_disable_unprepare(driver_data->vpu_clocks.aclk);
+	devm_clk_put(vpu_dev, driver_data->vpu_clocks.aclk);
+
+	clk_disable_unprepare(driver_data->vpu_clocks.iface);
+	devm_clk_put(vpu_dev, driver_data->vpu_clocks.iface);
+}
+
+static int enable_and_prepare_clocks(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data * __restrict const driver_data)
+{
+
+	int ret = 0;
+	struct clk * __restrict aclk;
+	struct clk * __restrict iface;
+
+	dev_info(vpu_dev, "Clock : Preparing aclk");
+	aclk = devm_clk_get(vpu_dev, "aclk");
+
+	if (IS_ERR(aclk)) {
+		ret = (int) aclk;
+		dev_err(vpu_dev, "Failed to get aclk : %d", ret);
+		goto get_aclk_failed;
+	}
+
+	ret = clk_prepare_enable(aclk);
+	if (ret) {
+		dev_err(vpu_dev, "Failed to prepare aclk : %d", ret);
+		goto prepare_aclk_failed;
+	}
+
+	dev_info(vpu_dev, "Clock : aclk prepared !");
+	dev_info(vpu_dev, "Clock : Preparing iface !");
+
+	iface = devm_clk_get(vpu_dev, "iface");
+	if (IS_ERR(iface)) {
+		ret = (int) iface;
+		dev_err(vpu_dev, "Failed to get iface : %d", ret);
+		goto get_iface_failed;
+	}
+
+	ret = clk_prepare_enable(iface);
+	if (ret) {
+		dev_err(vpu_dev, "Failed to prepare iface : %d", ret);
+		goto prepare_iface_failed;
+	}
+
+	dev_info(vpu_dev, "Clock : iface prepared !");
+
+	driver_data->vpu_clocks.aclk  = aclk;
+	driver_data->vpu_clocks.iface = iface;
+	return ret;
+
+// clk_disable_unprepare(iface);
+prepare_iface_failed:
+	devm_clk_put(vpu_dev, iface);
+get_iface_failed:
+	clk_disable_unprepare(aclk);
+prepare_aclk_failed:
+	devm_clk_put(vpu_dev, aclk);
+get_aclk_failed:
+	return ret;
 }
 
 /* Should return 0 on success and a negative errno on failure. */
@@ -433,25 +502,22 @@ static int myy_vpu_probe(struct platform_device * pdev)
 
 	/* Allocate the DMA buffer */
 	dev_info(vpu_dev, "devm_ioremap_resource");
-	vpu_base_address =
-		devm_ioremap_resource(vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	vpu_base_address = devm_ioremap_resource(
+		vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
 	if(IS_ERR(vpu_base_address)) {
-		dev_err("Could not remap the VPU resources...");
-		dev_err("So we can't address it, basically...");
-		ret = vpu_base_address;
+		dev_err(vpu_dev, "Could not remap the VPU resources...");
+		dev_err(vpu_dev, "So we can't address it, basically...");
+		ret = (int) vpu_base_address;
 		goto ioremap_failed;
 	}
 
 	driver_data->vpu_io.base     = vpu_base_address;
-	driver_data->vpu_io.dec_regs = vpu_base_address + driver_data->vpu_io.base
-	
-	// FIXME Setup the clocks in a reliable fashion.
-	// FIXME Disable the clocks on unload...
-	dev_info(vpu_dev, "clk_prepare_enable aclk");
-	clk_prepare_enable(devm_clk_get(vpu_dev, "aclk"));
+	driver_data->vpu_io.dec_regs = 
+		(u32 __iomem *)
+		(((u8 __iomem *) vpu_base_address) + VPU_DEC_REGS_OFFSET);
 
-	dev_info(vpu_dev, "clk_prepare_enable iface");
-	clk_prepare_enable(devm_clk_get(vpu_dev, "iface"));
+	enable_and_prepare_clocks(vpu_dev, driver_data);
+
 
 	/* Setup the private data storage for this device.
 	 * 
@@ -467,7 +533,6 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	 * releasing the driver.
 	 */
 	platform_set_drvdata(pdev, driver_data);
-
 	dev_info(vpu_dev, "Private data address : %p\n", driver_data);
 
 	/* Initialize our /dev entries
@@ -594,6 +659,9 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	print_regs(vpu_dev, test_regs);
 	prepare_the_registers(driver_data, test_regs);
 	print_regs(vpu_dev, test_regs);
+
+	copy_registers_and_launch_decoding(
+		vpu_dev, driver_data, test_regs);
 	return ret;
 
 get_vdpu_irq_failed:
@@ -605,7 +673,6 @@ cabac_table_dma_alloc_failed:
 		sizeof(test_encoded_frame),
 		driver_data->encoded_frame.mmu_address);
 encoded_frame_dma_alloc_failed:
-output_frame_dma_iommu_alloc_failed:
 	dma_free_coherent(vpu_dev,
 		N_PAGES_FOR_1080P_RGBA32,
 		driver_data->output_frame.mmu_address, GFP_KERNEL);
@@ -617,6 +684,8 @@ class_create_failed:
 cdev_add_failed:
 	unregister_chrdev_region(driver_data->device_id, 1);
 chrdev_alloc_failed:
+	disable_clocks(vpu_dev, driver_data);
+	devm_iounmap(vpu_dev, driver_data->vpu_io.base);
 ioremap_failed:
 	return ret;
 }
@@ -656,6 +725,8 @@ static int myy_vpu_remove(struct platform_device * pdev)
 
 	dev_info(vpu_dev, "DMA buffers Freed\n");
 
+	/*disable_clocks(vpu_dev, driver_data);
+	devm_ioremap_resource(vpu_dev, driver_data->vpu_io.base);*/
 
 	printk(KERN_INFO "Okay, I'll go, I'll go... !\n");
 
