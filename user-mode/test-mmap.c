@@ -11,6 +11,9 @@
 
 #include <stdlib.h>
 
+#include <sys/ioctl.h>
+#include "myy_ioctl.h"
+
 int main(void)
 {
 	int fd;
@@ -42,6 +45,8 @@ int main(void)
 		write(out_fd, address_from_mmap, len);
 		close(out_fd);
 	}
+
+	ioctl(fd, MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES, NULL);
 
 	fprintf(stderr,
 		"mmap_alloc: mmap OK - Address : %p\n",

@@ -38,9 +38,6 @@
 // Adds test_regs and test_encoded_frame
 #include "test_static_data.h"
 
-// Adds cabac_table
-#include "test_static_tables.h"
-
 // Provide H264dVdpu1Regs_t
 #include "rkmpp_h264_vpu_regs.h"
 
@@ -57,6 +54,8 @@
 //           What about the IRQ handlers ?
 //        Get the result
 
+// MYY_IOCTL_
+#include "myy-vpu.h"
 
 // Structures
 #define N_PAGES_FOR_1080P_RGBA32 (1000 * PAGE_SIZE)
@@ -78,13 +77,17 @@ struct myy_vpu_clocks {
 };
 
 struct myy_driver_data {
+	struct device * __restrict vpu_dev;
+
 	struct myy_dma output_frame;
-	struct myy_dma cabac_table;
-	// Our test only uses 1 frame, with no dependencies
+	struct myy_dma qtable;
 	struct myy_dma encoded_frame; 
+
 	dev_t device_id;
+
 	struct class * __restrict cls;
 	struct device * __restrict sub_dev;
+
 	struct myy_vpu_io vpu_io;
 	struct myy_vpu_clocks vpu_clocks;
 	/* Not a pointer in order to use the container_of macro hack to get
@@ -206,9 +209,13 @@ static inline void * allocate_dma_space(
 	u32 const size_in_octets,
 	dma_addr_t * __restrict const returned_dma_handle)
 {
-	return dma_alloc_coherent(dev,
+	void * cpu_mmu_address = dma_alloc_coherent(dev,
 		ALIGN(size_in_octets, PAGE_SIZE),
 		returned_dma_handle, GFP_KERNEL);
+
+	memset(cpu_mmu_address, 0, size_in_octets);
+
+	return cpu_mmu_address;
 }
 
 static inline void free_all_dma_space(
@@ -238,7 +245,7 @@ static void * allocate_dma_space_and_copy(
 	return cpu_mmu_address;
 }
 
-static void copy_registers_and_launch_decoding(
+void vpu_copy_registers(
 	struct device * __restrict const vpu,
 	struct myy_driver_data const * __restrict const driver_data,
 	u32 const * __restrict const regs)
@@ -263,7 +270,34 @@ static void copy_registers_and_launch_decoding(
 	}
 
 	// Let's do this !
-	writel_relaxed(1, hw_regs + 1);
+	//writel_relaxed(1, hw_regs + 1);
+}
+
+void vpu_launch_decoding(
+	struct device * __restrict const vpu,
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 const * __restrict const regs)
+{
+	writel_relaxed(1, driver_data->vpu_io.dec_regs + 1);
+}
+
+void output_frame_dump_first_bytes(
+	struct device const * __restrict const vpu_dev,
+	struct myy_dma const output_frame)
+{
+	u8 const * __restrict const output =
+		(u8 const * __restrict) output_frame.mmu_address;
+	u32 i;
+
+	dev_info(vpu_dev, "uint8_t output[4096] = {\n\t");
+	for (i = 0; i < 4096; i+=8) {
+		dev_info(vpu_dev, 
+			"\t0x%02x, 0x%02x, 0x%02x, 0x%02x, 0x%02x, "
+			"0x%02x, 0x%02x, 0x%02x, ",
+			output[i],   output[i+1], output[i+2], output[i+3],
+			output[i+4], output[i+5], output[i+6], output[i+7]);
+	}
+	dev_info(vpu_dev, "};");
 }
 
 static long test_user_dma_ioctl(
@@ -272,8 +306,32 @@ static long test_user_dma_ioctl(
 	unsigned long const arg)
 {
 
+	struct myy_driver_data const * __restrict const driver_data =
+		(struct myy_driver_data const *)
+		filp->private_data;
 
 	printk("IOCTL");
+	switch (cmd) {
+	case MYY_IOCTL_VPU_COPY_REGISTERS:
+		vpu_copy_registers(driver_data->vpu_dev, driver_data,
+			test_regs);
+		break;
+	case MYY_IOCTL_VPU_LAUNCH_DECODING:
+		vpu_launch_decoding(driver_data->vpu_dev, driver_data,
+			test_regs);
+		break;
+	case MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES:
+		output_frame_dump_first_bytes(driver_data->vpu_dev,
+			driver_data->output_frame);
+		break;
+	case MYY_IOCTL_CHECK_OUTPUT_WRITE:
+		dev_info(driver_data->vpu_dev,
+			"Strncmp : %d",
+			strncmp("\x01\x23\x45\x67\x89\xab\xcd\xef",
+				driver_data->output_frame.mmu_address,
+				sizeof("\x01\x23\x45\x67\x89\xab\xcd\xef")));
+		break;
+	}
 
 	//vdpu_write(vpu, VDPU_REG_INTERRUPT_DEC_E, VDPU_REG_INTERRUPT);
 	return 0;
@@ -284,15 +342,15 @@ static int test_user_dma_mmap(
 	struct file *filp,
 	struct vm_area_struct *vma)
 {
-	struct myy_driver_data const * __restrict const myy_driver_data =
+	struct myy_driver_data const * __restrict const driver_data =
 		(struct myy_driver_data const *)
 		filp->private_data;
 	int ret;
 	printk(KERN_INFO "MMAP !");
 
-	ret = dma_common_mmap(NULL, vma,
-		myy_driver_data->output_frame.mmu_address,
-		myy_driver_data->output_frame.iommu_address,
+	ret = dma_common_mmap(driver_data->vpu_dev, vma,
+		driver_data->output_frame.mmu_address,
+		driver_data->output_frame.iommu_address,
 		vma->vm_end - vma->vm_start);
 
 	if (ret)
@@ -353,9 +411,9 @@ static void print_dma_addresses(
 			driver_data->output_frame.mmu_address,
 			driver_data->output_frame.iommu_address);
 	dev_info(device, "%6s %p 0x%08x\n",
-			"CABAC",
-			driver_data->cabac_table.mmu_address,
-			driver_data->cabac_table.iommu_address);
+			"QTable",
+			driver_data->qtable.mmu_address,
+			driver_data->qtable.iommu_address);
 }
 
 static void prepare_the_registers(
@@ -372,7 +430,7 @@ static void prepare_the_registers(
 	for (i = 13; i < 30; i++)
 		regs[i] = driver_data->output_frame.iommu_address;
 
-	regs[40] = driver_data->cabac_table.iommu_address;
+	regs[40] = driver_data->qtable.iommu_address;
 
 	/* TODO This frame also contains an... offset ?
 	 *
@@ -403,7 +461,7 @@ static void prepare_the_registers(
 	 * drivers does the same shit, so let's do the same thing.
 	 * Maybe this register is documented somewhere...
 	 */
-	offset = 0; // regs[41] >> 10;
+	offset = regs[41] >> 10;
 	regs[41] = driver_data->output_frame.iommu_address +
 		offset;
 
@@ -503,6 +561,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	int ret;
 
 
+	driver_data->vpu_dev = vpu_dev;
 	/*print_platform_device(pdev);*/
 
 	/* Allocate the DMA buffer */
@@ -624,19 +683,19 @@ static int myy_vpu_probe(struct platform_device * pdev)
 		goto encoded_frame_dma_alloc_failed;
 	}
 
-	driver_data->cabac_table.mmu_address =
+	driver_data->qtable.mmu_address =
 		allocate_dma_space_and_copy(vpu_dev,
-			sizeof(h264_cabac_table),
-			&driver_data->cabac_table.iommu_address,
-			(u8 const *) h264_cabac_table,
-			sizeof(h264_cabac_table));
+			sizeof(test_qtable),
+			&driver_data->qtable.iommu_address,
+			(u8 const *) test_qtable,
+			sizeof(test_qtable));
 
-	if (!driver_data->cabac_table.mmu_address)
+	if (!driver_data->qtable.mmu_address)
 	{
 		dev_err(vpu_dev,
-			"No memory for the cabac table :C\n");
+			"No memory for the Qtable :C\n");
 		ret = -ENOMEM;
-		goto cabac_table_dma_alloc_failed;
+		goto qtable_dma_alloc_failed;
 	}
 
 	/* Setup the IRQ */
@@ -665,22 +724,24 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	prepare_the_registers(driver_data, test_regs);
 	print_regs(vpu_dev, test_regs);
 
-	copy_registers_and_launch_decoding(
-		vpu_dev, driver_data, test_regs);
+	vpu_copy_registers(vpu_dev, driver_data, test_regs);
+	vpu_launch_decoding(vpu_dev, driver_data, test_regs);
+	/*copy_registers_and_launch_decoding(
+		vpu_dev, driver_data, test_regs);*/
 	return ret;
 
 get_vdpu_irq_failed:
 	free_all_dma_space(vpu_dev,
 		sizeof(test_encoded_frame),
-		driver_data->cabac_table.mmu_address);
-cabac_table_dma_alloc_failed:
+		driver_data->qtable.mmu_address);
+qtable_dma_alloc_failed:
 	free_all_dma_space(vpu_dev,
 		sizeof(test_encoded_frame),
 		driver_data->encoded_frame.mmu_address);
 encoded_frame_dma_alloc_failed:
 	free_all_dma_space(vpu_dev,
 		1920*1080*4,
-		driver_data->output_frame.mmu_address, GFP_KERNEL);
+		driver_data->output_frame.mmu_address);
 output_frame_dma_alloc_failed:
 device_create_failed:
 	class_destroy(driver_data->cls);
@@ -718,15 +779,15 @@ static int myy_vpu_remove(struct platform_device * pdev)
 
 	free_all_dma_space(vpu_dev,
 		1920*1080*4,
-		driver_data->output_frame.mmu_address, GFP_KERNEL);
+		driver_data->output_frame.mmu_address);
 
 	free_all_dma_space(vpu_dev,
 		sizeof(test_encoded_frame),
 		driver_data->encoded_frame.mmu_address);
 
 	free_all_dma_space(vpu_dev,
-		sizeof(h264_cabac_table),
-		driver_data->cabac_table.mmu_address);
+		sizeof(test_qtable),
+		driver_data->qtable.mmu_address);
 
 	dev_info(vpu_dev, "DMA buffers Freed\n");
 
