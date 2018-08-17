@@ -45,6 +45,9 @@
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
 
+// copy_to_user
+#include <linux/uaccess.h>
+
 #include <linux/delay.h>
 // TODO : Copy the frame
 //        Pass the registers to the VPU
@@ -58,8 +61,8 @@
 #include "myy-vpu.h"
 
 // Structures
-#define N_PAGES_FOR_1080P_RGBA32 (1000 * PAGE_SIZE)
 #define VPU_DEC_REGS_OFFSET 0x400
+#define N_DEC_REGISTERS 41
 
 struct myy_dma {
 	dma_addr_t iommu_address;
@@ -136,6 +139,8 @@ static irqreturn_t vpu_is_done_or_borked(
 	 */
 	printk(KERN_INFO "IRQ : %d\n", irq);
 
+	printk(KERN_INFO "State : 0x%08x\n", 
+		readl_relaxed(driver_data->vpu_io.dec_regs + 1));
 	writel_relaxed(0, driver_data->vpu_io.dec_regs + 1);
 	return IRQ_HANDLED;
 }
@@ -213,7 +218,7 @@ static inline void * allocate_dma_space(
 		ALIGN(size_in_octets, PAGE_SIZE),
 		returned_dma_handle, GFP_KERNEL);
 
-	memset(cpu_mmu_address, 0, size_in_octets);
+	memset(cpu_mmu_address, 0xff, size_in_octets);
 
 	return cpu_mmu_address;
 }
@@ -245,8 +250,8 @@ static void * allocate_dma_space_and_copy(
 	return cpu_mmu_address;
 }
 
-void vpu_copy_registers(
-	struct device * __restrict const vpu,
+void vpu_write_registers(
+	struct device * __restrict const vpu_dev,
 	struct myy_driver_data const * __restrict const driver_data,
 	u32 const * __restrict const regs)
 {
@@ -264,8 +269,7 @@ void vpu_copy_registers(
 	writel_relaxed(regs[0], hw_regs);
 
 	// Prepare the VPU
-	for (i = 2; i < 59; i++)
-	{
+	for (i = 2; i < 59; i++) {
 		writel_relaxed(regs[i], hw_regs + i);
 	}
 
@@ -273,15 +277,29 @@ void vpu_copy_registers(
 	//writel_relaxed(1, hw_regs + 1);
 }
 
+void vpu_read_n_first_registers(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 * __restrict const dst,
+	u32 const n)
+{
+	u32 i;
+	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
+
+	for (i = 0; i < n; i++) {
+		dst[i] = readl_relaxed(hw_regs + i);
+	}
+}
+
 void vpu_launch_decoding(
-	struct device * __restrict const vpu,
+	struct device * __restrict const vpu_dev,
 	struct myy_driver_data const * __restrict const driver_data,
 	u32 const * __restrict const regs)
 {
 	writel_relaxed(1, driver_data->vpu_io.dec_regs + 1);
 }
 
-void output_frame_dump_first_bytes(
+/*void output_frame_dump_first_bytes(
 	struct device const * __restrict const vpu_dev,
 	struct myy_dma const output_frame)
 {
@@ -298,7 +316,7 @@ void output_frame_dump_first_bytes(
 			output[i+4], output[i+5], output[i+6], output[i+7]);
 	}
 	dev_info(vpu_dev, "};");
-}
+}*/
 
 static long test_user_dma_ioctl(
 	struct file * const filp,
@@ -312,18 +330,35 @@ static long test_user_dma_ioctl(
 
 	printk("IOCTL");
 	switch (cmd) {
-	case MYY_IOCTL_VPU_COPY_REGISTERS:
-		vpu_copy_registers(driver_data->vpu_dev, driver_data,
+	case MYY_IOCTL_VPU_WRITE_REGISTERS:
+		vpu_write_registers(driver_data->vpu_dev, driver_data,
 			test_regs);
 		break;
 	case MYY_IOCTL_VPU_LAUNCH_DECODING:
 		vpu_launch_decoding(driver_data->vpu_dev, driver_data,
 			test_regs);
 		break;
-	case MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES:
+	/*case MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES:
 		output_frame_dump_first_bytes(driver_data->vpu_dev,
 			driver_data->output_frame);
+		break;*/
+	case MYY_IOCTL_VPU_COPY_REGISTERS: {
+		u32 __user * const user_dst = (u32 __user *) arg;
+
+		u32   const buf_size = N_DEC_REGISTERS * sizeof(u32);
+		u32 * const tmp_dst  = kmalloc(buf_size, GFP_KERNEL);
+
+		vpu_read_n_first_registers(driver_data->vpu_dev, driver_data,
+			tmp_dst, N_DEC_REGISTERS);
+
+		if (copy_to_user(user_dst, tmp_dst, buf_size)) {
+			dev_err(driver_data->vpu_dev,
+				"Failed to copy the registers previously read");
+		}
+		kfree(tmp_dst);
+
 		break;
+	}
 	case MYY_IOCTL_CHECK_OUTPUT_WRITE:
 		dev_info(driver_data->vpu_dev,
 			"Strncmp : %d",
@@ -348,10 +383,10 @@ static int test_user_dma_mmap(
 	int ret;
 	printk(KERN_INFO "MMAP !");
 
-	ret = dma_common_mmap(driver_data->vpu_dev, vma,
+	ret = dma_mmap_attrs(driver_data->vpu_dev, vma,
 		driver_data->output_frame.mmu_address,
 		driver_data->output_frame.iommu_address,
-		vma->vm_end - vma->vm_start);
+		1920*1080*4, GFP_KERNEL);
 
 	if (ret)
 		printk(KERN_INFO "MMAP failed :C : -%d\n", ret);
@@ -376,6 +411,7 @@ static struct file_operations test_user_dma_fops = {
 	.release        = test_user_dma_release
 };
 
+/* Only usable with a set of 101 regs. */
 static void print_regs(
 	struct device const * __restrict const device,
 	u32 const * __restrict const regs)
@@ -448,9 +484,11 @@ static void prepare_the_registers(
 			* (pp->wFrameHeightInMbsMinus1 + 1);
 		dirMvOffset = picSizeInMbs
 			* ((p_hal->pp->chroma_format_idc == 0) ? 256 : 384);
-		dirMvOffset += (pp->field_pic_flag && pp->CurrPic.AssociatedFlag)
+		dirMvOffset +=
+			(pp->field_pic_flag && pp->CurrPic.AssociatedFlag)
 			? (picSizeInMbs * 32) : 0;
-		p_regs->SwReg41.dmmv_st_adr = (mpp_buffer_get_fd(frame_buf) | (dirMvOffset << 6));
+		p_regs->SwReg41.dmmv_st_adr =
+			(mpp_buffer_get_fd(frame_buf) | (dirMvOffset << 6));
 	  * }
 	  */
 	/* ... Used as an offset when the IDC profile is superior
@@ -462,8 +500,7 @@ static void prepare_the_registers(
 	 * Maybe this register is documented somewhere...
 	 */
 	offset = regs[41] >> 10;
-	regs[41] = driver_data->output_frame.iommu_address +
-		offset;
+	regs[41] = driver_data->output_frame.iommu_address + offset;
 
 }
 
@@ -503,6 +540,7 @@ static int enable_and_prepare_clocks(
 	}
 
 	dev_info(vpu_dev, "Clock : aclk prepared !");
+	dev_info(vpu_dev, "Speed : %lu", clk_get_rate(aclk));
 	dev_info(vpu_dev, "Clock : Preparing iface !");
 
 	iface = devm_clk_get(vpu_dev, "iface");
@@ -519,6 +557,7 @@ static int enable_and_prepare_clocks(
 	}
 
 	dev_info(vpu_dev, "Clock : iface prepared !");
+	dev_info(vpu_dev, "Speed : %lu", clk_get_rate(iface));
 
 	driver_data->vpu_clocks.aclk  = aclk;
 	driver_data->vpu_clocks.iface = iface;
@@ -536,7 +575,7 @@ get_aclk_failed:
 }
 
 /* Should return 0 on success and a negative errno on failure. */
-static int myy_vpu_probe(struct platform_device * pdev)
+static int myy_vpu_probe(struct platform_device * __restrict pdev)
 {
 	/* TODO Fragment this stupidly long function into several
 	 *      parts.
@@ -551,7 +590,7 @@ static int myy_vpu_probe(struct platform_device * pdev)
 
 	/* Will be used to create /dev entries */
 	struct cdev * __restrict const cdev = &driver_data->cdev;
-	const char * __restrict const name = pdev->dev.of_node->name;
+	char const * __restrict const name = pdev->dev.of_node->name;
 	void * vpu_base_address;
 
 	/* The "I'm done" or "The setup was invalid" IRQ number */
@@ -724,10 +763,8 @@ static int myy_vpu_probe(struct platform_device * pdev)
 	prepare_the_registers(driver_data, test_regs);
 	print_regs(vpu_dev, test_regs);
 
-	vpu_copy_registers(vpu_dev, driver_data, test_regs);
+	vpu_write_registers(vpu_dev, driver_data, test_regs);
 	vpu_launch_decoding(vpu_dev, driver_data, test_regs);
-	/*copy_registers_and_launch_decoding(
-		vpu_dev, driver_data, test_regs);*/
 	return ret;
 
 get_vdpu_irq_failed:

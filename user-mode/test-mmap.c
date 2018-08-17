@@ -46,7 +46,15 @@ int main(void)
 		close(out_fd);
 	}
 
-	ioctl(fd, MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES, NULL);
+	uint32_t regs[41];
+	ioctl(fd, MYY_IOCTL_VPU_COPY_REGISTERS, regs);
+
+	printf("uint32_t regs[41] = {\n\t");
+	for (uint_fast8_t i = 0; i < 41; i++) {
+		printf("0x%08x, ", regs[i]);
+		if (i % 7 == 7) printf("\n\t");
+	}
+	printf("\n};\n");
 
 	fprintf(stderr,
 		"mmap_alloc: mmap OK - Address : %p\n",
