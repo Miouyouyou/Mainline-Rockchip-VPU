@@ -37,6 +37,25 @@ int main(void)
 		exit(-1);
 	}
 
+	printf("Write the registers into the VPU HW...\n");
+	ioctl(fd, MYY_IOCTL_VPU_WRITE_REGISTERS);
+	sleep(1);
+
+	printf("Launch a decode pass...\n");
+	ioctl(fd, MYY_IOCTL_VPU_LAUNCH_DECODING);
+	sleep(1);
+
+	printf("Get the registers...\n");
+	uint32_t regs[60];
+	ioctl(fd, MYY_IOCTL_VPU_COPY_REGISTERS, regs);
+
+	printf("uint32_t regs[60] = {\n\t");
+	for (uint_fast8_t i = 0; i < 60; i++) {
+		printf("0x%08x, ", regs[i]);
+		if ((i & 3) == 3) printf("\n\t");
+	}
+	printf("\n};\n");
+
 	int const out_fd =
 		open("output_frame", O_RDWR|O_CREAT, 00664);
 	if (out_fd < 0)
@@ -45,16 +64,6 @@ int main(void)
 		write(out_fd, address_from_mmap, len);
 		close(out_fd);
 	}
-
-	uint32_t regs[41];
-	ioctl(fd, MYY_IOCTL_VPU_COPY_REGISTERS, regs);
-
-	printf("uint32_t regs[41] = {\n\t");
-	for (uint_fast8_t i = 0; i < 41; i++) {
-		printf("0x%08x, ", regs[i]);
-		if (i % 7 == 7) printf("\n\t");
-	}
-	printf("\n};\n");
 
 	fprintf(stderr,
 		"mmap_alloc: mmap OK - Address : %p\n",

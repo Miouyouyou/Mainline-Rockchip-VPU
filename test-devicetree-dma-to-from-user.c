@@ -48,6 +48,9 @@
 // copy_to_user
 #include <linux/uaccess.h>
 
+// iommu_ functions
+#include <linux/iommu.h>
+
 #include <linux/delay.h>
 // TODO : Copy the frame
 //        Pass the registers to the VPU
@@ -57,12 +60,17 @@
 //           What about the IRQ handlers ?
 //        Get the result
 
+/* To add :
+ * - devm_regulator_get_optional
+ * - devfreq_get_devfreq_by_phandle
+ */
+
 // MYY_IOCTL_
 #include "myy-vpu.h"
 
 // Structures
 #define VPU_DEC_REGS_OFFSET 0x400
-#define N_DEC_REGISTERS 41
+#define N_DEC_REGISTERS 60
 
 struct myy_dma {
 	dma_addr_t iommu_address;
@@ -77,6 +85,7 @@ struct myy_vpu_io {
 struct myy_vpu_clocks {
 	struct clk * aclk;
 	struct clk * iface;
+	struct clk * pd_video; // The vcodec service enables this one 
 };
 
 struct myy_driver_data {
@@ -93,13 +102,14 @@ struct myy_driver_data {
 
 	struct myy_vpu_io vpu_io;
 	struct myy_vpu_clocks vpu_clocks;
+	struct iommu_domain * __restrict iommu_domain;
 	/* Not a pointer in order to use the container_of macro hack to get
 	 * back this allocated data structure.
-	 * 
+	 *
 	 * Basically, when opening the /dev/node, the kernel will provide us
 	 * the inode of the opened node. From this inode, we'll get back the
 	 * address of the cdev structure that generated this /dev/node.
-	 * 
+	 *
 	 * Since :
 	 * - the cdev structure used in our code is actually embedded in
 	 *   a myy_driver_data structure;
@@ -107,11 +117,11 @@ struct myy_driver_data {
 	 *   cdev member inside myy_driver_data;
 	 * - the cdev structure address passed in "open" is actually the
 	 *   address of struct myy_driver_data + its cdev member offset.
-	 * 
+	 *
 	 * `container_of` will be able to use that cdev address to get the
 	 * address where `struct myy_driver_data` actually start and pass it
 	 * back to us.
-	 * 
+	 *
 	 * This will NEVER work if we allocate a memory region for cdev, using
 	 * `cdev_alloc` and only store its address in `myy_driver_data`,
 	 * since the address of `myy_driver_data` and the address of `cdev`
@@ -145,14 +155,24 @@ static irqreturn_t vpu_is_done_or_borked(
 	return IRQ_HANDLED;
 }
 
-/// Helpers
+int myy_iommu_fault_handler(
+	struct iommu_domain * domain,
+	struct device * vpu_dev,
+	unsigned long iova, int status,
+	void * data_from_handler_init)
+{
+	printk("IOMMU FAULT : %lu - %d", iova, status);
+	return 0;
+}
 
+
+/// Helpers
+//// Print functions
 static inline const char * __restrict myy_bool_str
 (bool value)
 {
 	return value ? "true" : "false";
 }
-
 
 static void print_resources
 (struct resource * resources, uint const n_resources)
@@ -193,223 +213,6 @@ static void print_platform_device
 	printk(KERN_INFO "Printing resources of device");
 	print_resources(pdev->resource, pdev->num_resources);
 }
-
-/// Open/IOCTL/Close/MMAP
-
-static int test_user_dma_open(
-	struct inode *inode,
-	struct file *filp)
-{
-	struct myy_driver_data * __restrict const myy_driver_data =
-		container_of(inode->i_cdev, struct myy_driver_data, cdev);
-	printk(KERN_INFO "Open !");
-	/* This backflip bullshit always got me */
-	filp->private_data = myy_driver_data;
-	return 0;
-}
-
-// TODO : Factoriser
-static inline void * allocate_dma_space(
-	struct device * __restrict const dev,
-	u32 const size_in_octets,
-	dma_addr_t * __restrict const returned_dma_handle)
-{
-	void * cpu_mmu_address = dma_alloc_coherent(dev,
-		ALIGN(size_in_octets, PAGE_SIZE),
-		returned_dma_handle, GFP_KERNEL);
-
-	memset(cpu_mmu_address, 0xff, size_in_octets);
-
-	return cpu_mmu_address;
-}
-
-static inline void free_all_dma_space(
-	struct device * __restrict const dev,
-	u32 const size_in_octets,
-	void * __restrict const mmu_address)
-{
-	dma_free_coherent(dev,
-		ALIGN(size_in_octets, PAGE_SIZE),
-		mmu_address, GFP_KERNEL);
-}
-
-static void * allocate_dma_space_and_copy(
-	struct device * __restrict const dev,
-	u32 const size_in_octets,
-	dma_addr_t * __restrict const returned_dma_handle,
-	u8 const * __restrict const data_to_copy,
-	u32 const data_size_in_octets)
-{
-	void * cpu_mmu_address = allocate_dma_space(
-		dev, ALIGN(size_in_octets, PAGE_SIZE),
-		returned_dma_handle);
-
-	if (cpu_mmu_address)
-		memcpy(cpu_mmu_address, data_to_copy, data_size_in_octets);
-
-	return cpu_mmu_address;
-}
-
-void vpu_write_registers(
-	struct device * __restrict const vpu_dev,
-	struct myy_driver_data const * __restrict const driver_data,
-	u32 const * __restrict const regs)
-{
-	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
-	u32 i;
-	/* According to Rockchip "vpu_service" code, only the registers
-	 * 0, [2,59] should be copied.
-	 * Well, reg[1] contains the "Let's do this !" bit which will
-	 * just launch the VPU.
-	 * If you copy blindly, the VPU will just run before being set
-	 * up correctly, leading to all sorts of problems.
-	 */
-
-	// I don't know what the base is for...
-	writel_relaxed(regs[0], hw_regs);
-
-	// Prepare the VPU
-	for (i = 2; i < 59; i++) {
-		writel_relaxed(regs[i], hw_regs + i);
-	}
-
-	// Let's do this !
-	//writel_relaxed(1, hw_regs + 1);
-}
-
-void vpu_read_n_first_registers(
-	struct device * __restrict const vpu_dev,
-	struct myy_driver_data const * __restrict const driver_data,
-	u32 * __restrict const dst,
-	u32 const n)
-{
-	u32 i;
-	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
-
-	for (i = 0; i < n; i++) {
-		dst[i] = readl_relaxed(hw_regs + i);
-	}
-}
-
-void vpu_launch_decoding(
-	struct device * __restrict const vpu_dev,
-	struct myy_driver_data const * __restrict const driver_data,
-	u32 const * __restrict const regs)
-{
-	writel_relaxed(1, driver_data->vpu_io.dec_regs + 1);
-}
-
-/*void output_frame_dump_first_bytes(
-	struct device const * __restrict const vpu_dev,
-	struct myy_dma const output_frame)
-{
-	u8 const * __restrict const output =
-		(u8 const * __restrict) output_frame.mmu_address;
-	u32 i;
-
-	dev_info(vpu_dev, "uint8_t output[4096] = {\n\t");
-	for (i = 0; i < 4096; i+=8) {
-		dev_info(vpu_dev, 
-			"\t0x%02x, 0x%02x, 0x%02x, 0x%02x, 0x%02x, "
-			"0x%02x, 0x%02x, 0x%02x, ",
-			output[i],   output[i+1], output[i+2], output[i+3],
-			output[i+4], output[i+5], output[i+6], output[i+7]);
-	}
-	dev_info(vpu_dev, "};");
-}*/
-
-static long test_user_dma_ioctl(
-	struct file * const filp,
-	unsigned int const cmd,
-	unsigned long const arg)
-{
-
-	struct myy_driver_data const * __restrict const driver_data =
-		(struct myy_driver_data const *)
-		filp->private_data;
-
-	printk("IOCTL");
-	switch (cmd) {
-	case MYY_IOCTL_VPU_WRITE_REGISTERS:
-		vpu_write_registers(driver_data->vpu_dev, driver_data,
-			test_regs);
-		break;
-	case MYY_IOCTL_VPU_LAUNCH_DECODING:
-		vpu_launch_decoding(driver_data->vpu_dev, driver_data,
-			test_regs);
-		break;
-	/*case MYY_IOCTL_DUMP_OUTPUT_FIRST_BYTES:
-		output_frame_dump_first_bytes(driver_data->vpu_dev,
-			driver_data->output_frame);
-		break;*/
-	case MYY_IOCTL_VPU_COPY_REGISTERS: {
-		u32 __user * const user_dst = (u32 __user *) arg;
-
-		u32   const buf_size = N_DEC_REGISTERS * sizeof(u32);
-		u32 * const tmp_dst  = kmalloc(buf_size, GFP_KERNEL);
-
-		vpu_read_n_first_registers(driver_data->vpu_dev, driver_data,
-			tmp_dst, N_DEC_REGISTERS);
-
-		if (copy_to_user(user_dst, tmp_dst, buf_size)) {
-			dev_err(driver_data->vpu_dev,
-				"Failed to copy the registers previously read");
-		}
-		kfree(tmp_dst);
-
-		break;
-	}
-	case MYY_IOCTL_CHECK_OUTPUT_WRITE:
-		dev_info(driver_data->vpu_dev,
-			"Strncmp : %d",
-			strncmp("\x01\x23\x45\x67\x89\xab\xcd\xef",
-				driver_data->output_frame.mmu_address,
-				sizeof("\x01\x23\x45\x67\x89\xab\xcd\xef")));
-		break;
-	}
-
-	//vdpu_write(vpu, VDPU_REG_INTERRUPT_DEC_E, VDPU_REG_INTERRUPT);
-	return 0;
-	
-}
-
-static int test_user_dma_mmap(
-	struct file *filp,
-	struct vm_area_struct *vma)
-{
-	struct myy_driver_data const * __restrict const driver_data =
-		(struct myy_driver_data const *)
-		filp->private_data;
-	int ret;
-	printk(KERN_INFO "MMAP !");
-
-	ret = dma_mmap_attrs(driver_data->vpu_dev, vma,
-		driver_data->output_frame.mmu_address,
-		driver_data->output_frame.iommu_address,
-		1920*1080*4, GFP_KERNEL);
-
-	if (ret)
-		printk(KERN_INFO "MMAP failed :C : -%d\n", ret);
-
-	return ret;
-}
-
-static int test_user_dma_release(
-	struct inode * inode,
-	struct file * filp)
-{
-	printk(KERN_INFO "Close !");
-	return 0;
-}
-
-
-static struct file_operations test_user_dma_fops = {
-	.owner          = THIS_MODULE,
-	.open           = test_user_dma_open,
-	.unlocked_ioctl = test_user_dma_ioctl,
-	.mmap           = test_user_dma_mmap,
-	.release        = test_user_dma_release
-};
 
 /* Only usable with a set of 101 regs. */
 static void print_regs(
@@ -452,6 +255,53 @@ static void print_dma_addresses(
 			driver_data->qtable.iommu_address);
 }
 
+//// DMA Helpers
+static inline void * allocate_dma_space(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	dma_addr_t * __restrict const returned_dma_handle)
+{
+	void * cpu_mmu_address = dma_alloc_coherent(dev,
+		ALIGN(size_in_octets, PAGE_SIZE),
+		returned_dma_handle, GFP_KERNEL);
+
+	memset(cpu_mmu_address, 0xff, size_in_octets);
+
+	return cpu_mmu_address;
+}
+
+static inline void free_all_dma_space(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	void * __restrict const mmu_address)
+{
+	dma_free_coherent(dev,
+		ALIGN(size_in_octets, PAGE_SIZE),
+		mmu_address, GFP_KERNEL);
+}
+
+static void * allocate_dma_space_and_copy(
+	struct device * __restrict const dev,
+	u32 const size_in_octets,
+	dma_addr_t * __restrict const returned_dma_handle,
+	u8 const * __restrict const data_to_copy,
+	u32 const data_size_in_octets)
+{
+	void * cpu_mmu_address = allocate_dma_space(
+		dev, ALIGN(size_in_octets, PAGE_SIZE),
+		returned_dma_handle);
+
+	if (cpu_mmu_address)
+		memcpy(cpu_mmu_address, data_to_copy, data_size_in_octets);
+
+	return cpu_mmu_address;
+}
+
+/// VPU Read/Write
+
+/** Prepare the VPU registers by switching File descriptors
+ *  with actual IOVA addresses.
+ */
 static void prepare_the_registers(
 	struct myy_driver_data const * __restrict const driver_data,
 	u32 * __restrict const regs)
@@ -472,7 +322,7 @@ static void prepare_the_registers(
 	 *
 	 * It seems to be some kind of hack due to design limits
 	 * of the VPU.
-	 * 
+	 *
 	 * The offset is computed like this on RKMPP
 	 *
 	 * {
@@ -502,7 +352,84 @@ static void prepare_the_registers(
 	offset = regs[41] >> 10;
 	regs[41] = driver_data->output_frame.iommu_address + offset;
 
+	/* Mimic this : 
+	 * 	p_regs->SwReg57.sw_cache_en = 1;
+	 * 	p_regs->SwReg57.sw_pref_sigchan = 1;
+	 * 	p_regs->SwReg57.sw_intra_dbl3t = 1;
+	 * 	p_regs->SwReg57.sw_inter_dblspeed = 1;
+	 * 	p_regs->SwReg57.sw_intra_dblspeed = 1;
+	 * 	p_regs->SwReg57.sw_paral_bus = 1;
+	 */
+
+	regs[57] = 0xde;
+
 }
+
+/**
+ * Write the provided registers values into register 0 and
+ * and registers 2 to 58 of the VPU hardware.
+ */
+void vpu_write_registers(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 const * __restrict const regs)
+{
+	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
+	u32 i;
+	/* According to Rockchip "vpu_service" code, only the registers
+	 * 0, [2,59] should be copied.
+	 * Well, reg[1] contains the "Let's do this !" bit which will
+	 * just launch the VPU.
+	 * If you copy blindly, the VPU will just run before being set
+	 * up correctly, leading to all sorts of problems.
+	 */
+
+	/* There's actually a clean cache register and reset
+	 * register... Let's use them.
+	 * Copied from vcodec_service.
+	 */
+#define VDPU_SOFT_RESET_REG	101
+#define VDPU_CLEAN_CACHE_REG	516
+
+	//writel_relaxed(1, hw_regs + VDPU_SOFT_RESET_REG);
+	writel_relaxed(1, hw_regs + VDPU_CLEAN_CACHE_REG);
+
+	mdelay(50);
+	// I don't know what the base is for...
+	writel_relaxed(regs[0], hw_regs);
+
+	// Prepare the VPU
+	for (i = 2; i < 60; i++) {
+		writel_relaxed(regs[i], hw_regs + i);
+	}
+
+	// Let's do this !
+	//writel_relaxed(1, hw_regs + 1);
+}
+
+void vpu_read_n_first_registers(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 * __restrict const dst,
+	u32 const n)
+{
+	u32 i;
+	u32 __iomem * const hw_regs = driver_data->vpu_io.dec_regs;
+
+	for (i = 0; i < n; i++) {
+		dst[i] = readl_relaxed(hw_regs + i);
+	}
+}
+
+void vpu_launch_decoding(
+	struct device * __restrict const vpu_dev,
+	struct myy_driver_data const * __restrict const driver_data,
+	u32 const * __restrict const regs)
+{
+	writel_relaxed(1, driver_data->vpu_io.dec_regs + 1);
+}
+
+/// Clocks
 
 static void disable_clocks(
 	struct device * __restrict const vpu_dev,
@@ -524,6 +451,7 @@ static int enable_and_prepare_clocks(
 	struct clk * __restrict aclk;
 	struct clk * __restrict iface;
 
+	// Aclk
 	dev_info(vpu_dev, "Clock : Preparing aclk");
 	aclk = devm_clk_get(vpu_dev, "aclk");
 
@@ -540,7 +468,9 @@ static int enable_and_prepare_clocks(
 	}
 
 	dev_info(vpu_dev, "Clock : aclk prepared !");
-	dev_info(vpu_dev, "Speed : %lu", clk_get_rate(aclk));
+	dev_info(vpu_dev, "Speed : %lu Hz", clk_get_rate(aclk));
+
+	// Iface 
 	dev_info(vpu_dev, "Clock : Preparing iface !");
 
 	iface = devm_clk_get(vpu_dev, "iface");
@@ -557,13 +487,13 @@ static int enable_and_prepare_clocks(
 	}
 
 	dev_info(vpu_dev, "Clock : iface prepared !");
-	dev_info(vpu_dev, "Speed : %lu", clk_get_rate(iface));
+	dev_info(vpu_dev, "Speed : %lu Hz", clk_get_rate(iface));
 
 	driver_data->vpu_clocks.aclk  = aclk;
 	driver_data->vpu_clocks.iface = iface;
 	return ret;
 
-// clk_disable_unprepare(iface);
+	//clk_disable_unprepare(iface);
 prepare_iface_failed:
 	devm_clk_put(vpu_dev, iface);
 get_iface_failed:
@@ -573,6 +503,111 @@ prepare_aclk_failed:
 get_aclk_failed:
 	return ret;
 }
+
+
+/// Open/IOCTL/Close/MMAP
+
+static int test_user_dma_open(
+	struct inode *inode,
+	struct file *filp)
+{
+	struct myy_driver_data * __restrict const myy_driver_data =
+		container_of(inode->i_cdev, struct myy_driver_data, cdev);
+	printk(KERN_INFO "Open !");
+	/* This backflip bullshit always got me */
+	filp->private_data = myy_driver_data;
+	return 0;
+}
+
+static long test_user_dma_ioctl(
+	struct file * const filp,
+	unsigned int const cmd,
+	unsigned long const arg)
+{
+
+	struct myy_driver_data const * __restrict const driver_data =
+		(struct myy_driver_data const *)
+		filp->private_data;
+
+	printk("IOCTL");
+	switch (cmd) {
+	case MYY_IOCTL_VPU_WRITE_REGISTERS:
+		vpu_write_registers(driver_data->vpu_dev, driver_data,
+			test_regs);
+		break;
+	case MYY_IOCTL_VPU_LAUNCH_DECODING:
+		vpu_launch_decoding(driver_data->vpu_dev, driver_data,
+			test_regs);
+		break;
+	case MYY_IOCTL_VPU_COPY_REGISTERS: {
+		u32 __user * const user_dst = (u32 __user *) arg;
+
+		u32   const buf_size = N_DEC_REGISTERS * sizeof(u32);
+		u32 * const tmp_dst  = kmalloc(buf_size, GFP_KERNEL);
+
+		vpu_read_n_first_registers(driver_data->vpu_dev, driver_data,
+			tmp_dst, N_DEC_REGISTERS);
+
+		if (copy_to_user(user_dst, tmp_dst, buf_size)) {
+			dev_err(driver_data->vpu_dev,
+				"Failed to copy the registers previously read");
+		}
+		kfree(tmp_dst);
+
+		break;
+	}
+	// Unused at the moment
+	case MYY_IOCTL_CHECK_OUTPUT_WRITE:
+		dev_info(driver_data->vpu_dev,
+			"Strncmp : %d",
+			strncmp("\x01\x23\x45\x67\x89\xab\xcd\xef",
+				driver_data->output_frame.mmu_address,
+				sizeof("\x01\x23\x45\x67\x89\xab\xcd\xef")));
+		break;
+	}
+
+	//vdpu_write(vpu, VDPU_REG_INTERRUPT_DEC_E, VDPU_REG_INTERRUPT);
+	return 0;
+
+}
+
+static int test_user_dma_mmap(
+	struct file *filp,
+	struct vm_area_struct *vma)
+{
+	struct myy_driver_data const * __restrict const driver_data =
+		(struct myy_driver_data const *)
+		filp->private_data;
+	int ret;
+	printk(KERN_INFO "MMAP !");
+
+	ret = dma_mmap_attrs(driver_data->vpu_dev, vma,
+		driver_data->output_frame.mmu_address,
+		driver_data->output_frame.iommu_address,
+		1920*1080*4, GFP_KERNEL);
+
+	if (ret)
+		printk(KERN_INFO "MMAP failed :C : -%d\n", ret);
+
+	return ret;
+}
+
+static int test_user_dma_release(
+	struct inode * inode,
+	struct file * filp)
+{
+	printk(KERN_INFO "Close !");
+	return 0;
+}
+
+
+static struct file_operations test_user_dma_fops = {
+	.owner          = THIS_MODULE,
+	.open           = test_user_dma_open,
+	.unlocked_ioctl = test_user_dma_ioctl,
+	.mmap           = test_user_dma_mmap,
+	.release        = test_user_dma_release
+};
 
 /* Should return 0 on success and a negative errno on failure. */
 static int myy_vpu_probe(struct platform_device * __restrict pdev)
@@ -603,7 +638,7 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 	driver_data->vpu_dev = vpu_dev;
 	/*print_platform_device(pdev);*/
 
-	/* Allocate the DMA buffer */
+	// Remapping
 	dev_info(vpu_dev, "devm_ioremap_resource");
 	vpu_base_address = devm_ioremap_resource(
 		vpu_dev, platform_get_resource(pdev, IORESOURCE_MEM, 0));
@@ -614,23 +649,25 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 		goto ioremap_failed;
 	}
 
+	// Setup the registers addresses
 	driver_data->vpu_io.base     = vpu_base_address;
 	driver_data->vpu_io.dec_regs = 
 		(u32 __iomem *)
 		(((u8 __iomem *) vpu_base_address) + VPU_DEC_REGS_OFFSET);
 
+	// Prepare the clocks
 	enable_and_prepare_clocks(vpu_dev, driver_data);
 
-
+	// Setup our "private data"
 	/* Setup the private data storage for this device.
-	 * 
+	 *
 	 * The data will be available through the device structure until
 	 * the driver module gets unloaded.
-	 * 
+	 *
 	 * platform_set_drvdata is equivalent to dev_set_drvdata, except that
 	 * - dev_set_drvdata takes a device pointer
 	 * - platform_set_drvdata takes a platform_device pointer
-	 * 
+	 *
 	 * The main difference between kzalloc and devm_kzalloc is that
 	 * allocated memory with devm_kzalloc gets automagically freed when
 	 * releasing the driver.
@@ -638,11 +675,12 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 	platform_set_drvdata(pdev, driver_data);
 	dev_info(vpu_dev, "Private data address : %p\n", driver_data);
 
+	// CDEV initialization and setup
 	/* Initialize our /dev entries
-	 * 
+	 *
 	 * It seems that creating a sub-device is necessary to get the
 	 * - /dev/#{name} entries to appear... Weird
-	 * 
+	 *
 	 * alloc_chrdev_region will call MKDEV
 	 */
 	dev_info(vpu_dev, "alloc_chrdev_region");
@@ -691,6 +729,29 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 		goto device_create_failed;
 	}
 
+	// IOMMU fault handlers - Just in case...
+	// Useless - The fault handler is never called in our case.
+	driver_data->iommu_domain = iommu_get_domain_for_dev(vpu_dev);
+	if (!driver_data->iommu_domain) {
+		dev_err(vpu_dev,
+			"No domain for the device... ???\n");
+		goto iommu_get_domain_for_dev_failed;
+	}
+	iommu_set_fault_handler(driver_data->iommu_domain,
+		myy_iommu_fault_handler,
+		driver_data);
+
+	// Set the DMA Mask - No visible changes
+	// The DMA mask is set correctly, but I think it's already set
+	// on device initialization, due to how DTS nodes work now.
+	ret = dma_set_coherent_mask(vpu_dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(vpu_dev, "could not set DMA coherent mask\n");
+		goto dma_set_coherent_mask_failed;
+	}
+
+	// DMA Buffers Allocations.
+	// iommu_address == IOVA
 	driver_data->output_frame.mmu_address = 
 		allocate_dma_space(
 			vpu_dev,
@@ -737,6 +798,7 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 		goto qtable_dma_alloc_failed;
 	}
 
+	// IRQ - Setup handlers
 	/* Setup the IRQ */
 	irq_dec = platform_get_irq_byname(pdev, "irq_dec");
 	if (irq_dec <= 0) {
@@ -758,6 +820,7 @@ static int myy_vpu_probe(struct platform_device * __restrict pdev)
 		goto get_vdpu_irq_failed;
 	}
 
+	// Print some debug informations and execute a decode pass.
 	print_dma_addresses(vpu_dev, driver_data);
 	print_regs(vpu_dev, test_regs);
 	prepare_the_registers(driver_data, test_regs);
@@ -780,6 +843,8 @@ encoded_frame_dma_alloc_failed:
 		1920*1080*4,
 		driver_data->output_frame.mmu_address);
 output_frame_dma_alloc_failed:
+dma_set_coherent_mask_failed:
+iommu_get_domain_for_dev_failed:
 device_create_failed:
 	class_destroy(driver_data->cls);
 class_create_failed:
@@ -796,6 +861,9 @@ ioremap_failed:
 /* Should return 0 on success and a negative errno on failure. */
 static int myy_vpu_remove(struct platform_device * pdev)
 {
+	// Very badly setup. Currently, a full reboot is done instead of
+	// unloading/reloading the module.
+
 	/* The device associated with the platform_device. Identifier
 	 * used for convenience. (Dereferencing pdev every time is useless) */
 	struct device * __restrict const vpu_dev = &pdev->dev;

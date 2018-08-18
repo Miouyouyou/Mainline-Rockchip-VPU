@@ -21,6 +21,7 @@ all:
 clean:
 	make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(PWD) -C $(MYY_KERNEL_DIR) clean
 
-install:
+install: all
 	scp test-devicetree-dma-to-from-user.ko tinkerboard:/tmp
+	scp -r user-mode/ tinkerboard:/tmp
 
